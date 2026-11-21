@@ -36,7 +36,7 @@ export async function setupApp() {
 }
 
 export async function resetDb(db: Db) {
-  await db.query(`TRUNCATE donations, refunds, milestone_releases, proofs, campaigns,
+  await db.query(`TRUNCATE pending_campaign_events, campaign_refresh_queue, donations, refunds, milestone_releases, proofs, campaigns,
     campaign_metadata, verifiers, indexer_state, daily_stats_snapshots,
     webhook_deliveries, webhook_subscriptions, gdacs_alerts`);
 }
@@ -133,7 +133,7 @@ function rawEvent(topic: xdr.ScVal[], value: xdr.ScVal, ledger = 100): rpc.Api.E
 export const events = {
   created: (id: bigint, creator: string) =>
     rawEvent(
-      [sym('campaign_created'), u64(id)],
+      [sym('created'), u64(id)],
       dataMap([
         ['creator', addr(creator)],
         ['deadline', u64(1n)],
@@ -144,25 +144,23 @@ export const events = {
   donated: (id: bigint, donor: string, amount: bigint) =>
     rawEvent(
       [sym('donated'), u64(id), addr(donor)],
-      dataMap([['amount', nativeToScVal(amount, { type: 'i128' })]]),
+      nativeToScVal(amount, { type: 'i128' }),
     ),
   released: (id: bigint, index: number, amount: bigint, proofUri: string) =>
     rawEvent(
-      [sym('milestone_released'), u64(id)],
-      dataMap([
-        ['amount', nativeToScVal(amount, { type: 'i128' })],
-        ['index', nativeToScVal(index, { type: 'u32' })],
-        ['proof_uri', nativeToScVal(proofUri, { type: 'string' })],
-      ]),
+      [sym('released'), u64(id), nativeToScVal(index, { type: 'u32' })],
+      xdr.ScVal.scvVec([nativeToScVal(amount, { type: 'i128' }), nativeToScVal(proofUri, { type: 'string' })]),
     ),
   refunded: (id: bigint, donor: string, amount: bigint) =>
     rawEvent(
       [sym('refunded'), u64(id), addr(donor)],
       dataMap([['amount', nativeToScVal(amount, { type: 'i128' })]]),
     ),
+  reassigned: (id: bigint, oldVerifier: string, newVerifier: string) =>
+    rawEvent([sym('vf_reass'), u64(id)], xdr.ScVal.scvVec([addr(oldVerifier), addr(newVerifier)])),
   verifier: (verifier: string, active: boolean) =>
     rawEvent(
-      [sym('verifier_updated'), addr(verifier)],
-      dataMap([['active', xdr.ScVal.scvBool(active)]]),
+      [sym('verifier'), addr(verifier)],
+      xdr.ScVal.scvBool(active),
     ),
 };

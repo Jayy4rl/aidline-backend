@@ -125,13 +125,33 @@ describe('Indexer', () => {
     expect((await db.query('SELECT active FROM verifiers')).rows[0].active).toBe(false);
   });
 
-  it('rolls back the whole page if the chain read fails', async () => {
+  it('keeps the cursor moving and queues events for an unreadable campaign', async () => {
     const chain = new FakeChain();
-    chain.pages.push([events.donated(9n, account(), 5n)]);
+    const good = chainCampaign({ id: 1n, raised: 7n });
+    chain.campaigns.set(1n, good);
+    chain.pages.push([events.created(1n, good.creator), events.donated(1n, account(), 7n), events.donated(9n, account(), 5n)]);
+    const indexer = indexerFor(chain);
+    await expect(indexer.syncOnce()).resolves.toBe(3);
+    expect((await db.query('SELECT count(*)::int AS n FROM donations')).rows[0].n).toBe(1);
+    expect((await db.query('SELECT count(*)::int AS n FROM pending_campaign_events')).rows[0].n).toBe(1);
+    expect((await db.query('SELECT cursor FROM indexer_state')).rows[0].cursor).toBe('cursor-1');
+    chain.campaigns.set(9n, chainCampaign({ id: 9n }));
+    await indexer.syncOnce();
+    expect((await db.query('SELECT count(*)::int AS n FROM donations')).rows[0].n).toBe(2);
+  });
 
-    await expect(indexerFor(chain).syncOnce()).rejects.toThrow('no campaign 9');
-    const s = await db.query('SELECT cursor FROM indexer_state');
-    expect(s.rowCount).toBe(0);
+  it('refreshes the campaign verifier immediately on reassignment', async () => {
+    const chain = new FakeChain();
+    const original = chainCampaign({ id: 2n });
+    chain.campaigns.set(2n, original);
+    chain.pages.push([events.created(2n, original.creator)]);
+    const indexer = indexerFor(chain);
+    await indexer.syncOnce();
+    const nextVerifier = account();
+    chain.campaigns.set(2n, { ...original, verifier: nextVerifier });
+    chain.pages.push([events.reassigned(2n, original.verifier, nextVerifier)]);
+    await indexer.syncOnce();
+    expect((await db.query('SELECT verifier FROM campaigns WHERE id = $1', ['2'])).rows[0].verifier).toBe(nextVerifier);
   });
 
   // ── Issue #23: cursor-retention recovery ─────────────────────────────────

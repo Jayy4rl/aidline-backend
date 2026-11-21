@@ -150,7 +150,19 @@ export class Indexer {
       for (const ev of events) {
         if ('campaignId' in ev) {
           const campaign = campaigns.get(ev.campaignId);
-          if (campaign) await upsertCampaign(client, campaign, ev);
+          if (campaign) {
+            await upsertCampaign(client, campaign, ev);
+          } else {
+            await client.query(
+              'INSERT INTO campaign_refresh_queue (campaign_id) VALUES ($1) ON CONFLICT DO NOTHING',
+              [ev.campaignId.toString()],
+            );
+            await client.query(
+              'INSERT INTO pending_campaign_events (event_id, campaign_id, payload) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+              [ev.eventId, ev.campaignId.toString(), JSON.stringify(ev, (_key, value: unknown) => typeof value === 'bigint' ? value.toString() : value)],
+            );
+            continue;
+          }
         }
         await recordEvent(client, ev);
       }
@@ -168,6 +180,8 @@ export class Indexer {
     } finally {
       client.release();
     }
+
+    await this.retryPendingCampaigns();
 
     // A committed write makes cached aggregates stale, so drop them immediately.
     this.opts.cache?.clear();
@@ -316,7 +330,43 @@ export class Indexer {
       (entry): entry is readonly [bigint, Awaited<ReturnType<ContractReader['getCampaign']>>] =>
         entry !== null,
     );
-    return new Map(entries);
+    const ids = rows.map((row) => BigInt(row.campaign_id));
+    const found = await this.readCampaigns(ids);
+    for (const row of rows) {
+      const id = BigInt(row.campaign_id);
+      const campaign = found.get(id);
+      if (!campaign) {
+        await this.opts.db.query(
+          'UPDATE campaign_refresh_queue SET last_attempt_at = now() WHERE campaign_id = $1',
+          [row.campaign_id],
+        );
+        continue;
+      }
+      const client = await this.opts.db.connect();
+      try {
+        await client.query('BEGIN');
+        await upsertCampaign(client, campaign, { ledger: 0, closedAt: new Date() });
+        const pending = await client.query<{ payload: AidlineEvent }>(
+          'SELECT payload FROM pending_campaign_events WHERE campaign_id = $1 ORDER BY created_at, event_id',
+          [row.campaign_id],
+        );
+        for (const { payload } of pending.rows) {
+          const ev = { ...payload, campaignId: id, closedAt: new Date(payload.closedAt) } as AidlineEvent;
+          if ('amount' in ev) ev.amount = BigInt(ev.amount);
+          if ('campaignId' in ev && ev.type === 'milestone_released') ev.amount = BigInt(ev.amount);
+          await recordEvent(client, ev);
+        }
+        await client.query('DELETE FROM pending_campaign_events WHERE campaign_id = $1', [row.campaign_id]);
+        await client.query('DELETE FROM campaign_refresh_queue WHERE campaign_id = $1', [row.campaign_id]);
+        await client.query('COMMIT');
+        this.warnedCampaigns.delete(row.campaign_id);
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+    }
   }
 
   private async startLedger(): Promise<{ ledger: number; source: 'configured' | 'default' | 'rpc_oldest' }> {
